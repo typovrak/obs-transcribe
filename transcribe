@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Runs the tool through Nix without installing anything: ./transcribe ~/Videos/my-video.mp4
+set -euo pipefail
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec nix run "path:$dir" -- "$@"
