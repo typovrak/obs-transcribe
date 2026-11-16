@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Local transcription of OBS videos (mkv/mp4) into Markdown for Claude.
 
-Pipeline: ffmpeg (16 kHz mono audio extraction) → whisper.cpp (whisper-cli, Vulkan GPU
-or CPU) → formatting into timestamped paragraphs.
+Pipeline: ffmpeg (16 kHz mono audio extraction) → whisper.cpp (whisper-cli, Vulkan/CUDA
+GPU or CPU) → formatting into timestamped paragraphs.
 
-Dependencies: python3 (standard library only), ffmpeg/ffprobe and whisper-cli
-(provided by the project's Nix flake).
+Dependencies: python3 (standard library only), ffmpeg/ffprobe and whisper-cli on the PATH.
+The launchers provide them: ./transcribe (Nix), ./transcribe-debian (Debian/Ubuntu),
+transcribe-windows.cmd (Windows).
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import glob
 import json
 import os
 import re
@@ -27,13 +29,20 @@ VERSION = "0.1.0"
 
 DEFAULT_MODEL = os.environ.get("VIT_MODEL", "large-v3-turbo")
 DEFAULT_LANG = os.environ.get("VIT_LANG", "auto")
+IS_WINDOWS = os.name == "nt"
+
+
+def _app_dir(xdg_var: str, xdg_default: Path) -> Path:
+    if IS_WINDOWS:
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "obs-transcribe"
+    return Path(os.environ.get(xdg_var) or xdg_default) / "obs-transcribe"
+
+
 DEFAULT_MODELS_DIR = Path(
     os.environ.get("VIT_MODELS_DIR")
-    or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-    / "obs-transcribe"
-    / "models"
+    or _app_dir("XDG_DATA_HOME", Path.home() / ".local" / "share") / "models"
 )
-CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "obs-transcribe"
+CACHE_DIR = _app_dir("XDG_CACHE_HOME", Path.home() / ".cache") / ("cache" if IS_WINDOWS else "")
 
 WHISPER_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin"
 VAD_MODEL_FILE = "ggml-silero-v5.1.2.bin"
@@ -69,6 +78,10 @@ class Fatal(Exception):
     """Expected error, printed without a traceback."""
 
 
+# Absolute paths of the external tools, filled by check_dependencies().
+TOOLS: dict[str, str] = {}
+
+
 # --------------------------------------------------------------------------- output
 
 def info(msg: str = "") -> None:
@@ -77,6 +90,28 @@ def info(msg: str = "") -> None:
 
 def progress(msg: str) -> None:
     print("\r\033[K" + msg, end="", file=sys.stderr, flush=True)
+
+
+def setup_console() -> None:
+    """Windows: UTF-8 output even when piped, and ANSI escapes for the progress line."""
+    if not IS_WINDOWS:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if (getattr(stream, "encoding", "") or "").lower().replace("-", "") != "utf8":
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-12)  # STD_ERROR_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except (AttributeError, OSError):
+        pass
 
 
 def fmt_ts(ms: int) -> str:
@@ -145,37 +180,53 @@ def ensure_vad_model(models_dir: Path) -> Path:
 # --------------------------------------------------------------------------- external tools
 
 def check_dependencies() -> None:
-    missing = [t for t in ("ffmpeg", "ffprobe", "whisper-cli") if shutil.which(t) is None]
+    missing = []
+    for tool in ("ffmpeg", "ffprobe", "whisper-cli"):
+        path = os.environ.get("VIT_" + tool.upper().replace("-", "_")) or shutil.which(tool)
+        if path is None:
+            missing.append(tool)
+        else:
+            TOOLS[tool] = path
     if missing:
         raise Fatal(
-            f"missing tool(s): {', '.join(missing)}. "
-            'Run the script through "./transcribe" (nix run) or inside "nix develop".'
+            f"missing tool(s): {', '.join(missing)}. Run the script through its launcher: "
+            '"./transcribe" (NixOS / Nix), "./transcribe-debian" (Debian / Ubuntu) '
+            'or "transcribe-windows" (Windows).'
         )
 
 
-def pick_gpu_device() -> tuple[int, str] | None:
-    """Pick the Vulkan device: the dedicated GPU (NVIDIA/AMD) rather than the Intel iGPU.
+def pick_gpu_device() -> tuple[int, str, str] | None | bool:
+    """Pick the GPU: the dedicated one (NVIDIA/AMD) rather than an integrated Intel GPU.
 
-    whisper-cli uses device 0 by default, which is often the iGPU on a laptop.
+    whisper-cli uses device 0 by default, which is often the iGPU on a laptop. Return
+    (index, name, backend); False if whisper-cli only sees software renderers (llvmpipe),
+    so the caller should force the CPU; None if no GPU backend was detected.
     """
     try:
-        r = subprocess.run(["whisper-cli", "--help"], capture_output=True, text=True, timeout=60)
+        r = subprocess.run([TOOLS["whisper-cli"], "--help"], capture_output=True, text=True,
+                           errors="replace", timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    devices = re.findall(r"ggml_vulkan: (\d+) = (.+?) \|", r.stderr + r.stdout)
+    out = r.stderr + r.stdout
+    # Vulkan: "ggml_vulkan: 1 = NVIDIA GeForce GTX 1660 Ti (NVIDIA) | uma: 0 | ..."
+    # CUDA:   "  Device 0: NVIDIA GeForce GTX 1660 Ti, compute capability 7.5, VMM: yes"
+    devices = [(int(i), n, "Vulkan") for i, n in re.findall(r"ggml_vulkan: (\d+) = (.+?) \|", out)]
+    devices += [(int(i), n, "CUDA") for i, n in re.findall(r"Device (\d+): (.+?), compute capability", out)]
     if not devices:
         return None
-    usable = [(int(i), n) for i, n in devices if "llvmpipe" not in n.lower()]
+    usable = [d for d in devices if not re.search(r"llvmpipe|lavapipe|swiftshader", d[1], re.I)]
+    if not usable:
+        return False
     discrete = [d for d in usable if re.search(r"nvidia|amd|radeon|arc", d[1], re.I)]
-    index, name = (discrete or usable or [(int(devices[0][0]), devices[0][1])])[0]
+    index, name, backend = (discrete or usable)[0]
     name = re.sub(r"\s*\([^()]*\)\s*$", "", name)  # drop the driver name, e.g. "(NVIDIA)"
-    return index, name
+    return index, name, backend
 
 
 def probe(video: Path) -> tuple[float, int]:
     """Return (duration in seconds, number of audio tracks). Raise Fatal if unreadable."""
-    cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(video)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    cmd = [TOOLS["ffprobe"], "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(video)]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         err = (r.stderr.strip().splitlines() or ["ffprobe failed"])[-1]
         hint = ""
@@ -192,7 +243,7 @@ def probe(video: Path) -> tuple[float, int]:
 
 
 def extract_audio(video: Path, wav: Path, n_tracks: int, track: int | None) -> None:
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-y", "-i", str(video)]
+    cmd = [TOOLS["ffmpeg"], "-nostdin", "-hide_banner", "-v", "error", "-y", "-i", str(video)]
     if track is not None:
         if not 1 <= track <= n_tracks:
             raise Fatal(f"audio track {track} does not exist (the file has {n_tracks})")
@@ -202,7 +253,7 @@ def extract_audio(video: Path, wav: Path, n_tracks: int, track: int | None) -> N
         inputs = "".join(f"[0:a:{i}]" for i in range(n_tracks))
         cmd += ["-filter_complex", f"{inputs}amix=inputs={n_tracks}:duration=longest[a]", "-map", "[a]"]
     cmd += ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         err = (r.stderr.strip().splitlines() or ["ffmpeg failed"])[-1]
         raise Fatal(f"audio extraction failed: {err}")
@@ -222,7 +273,7 @@ def run_whisper(
     srt: bool,
 ) -> dict:
     cmd = [
-        "whisper-cli", "-m", str(model_path), "-f", str(wav), "-l", lang, "-t", str(threads),
+        TOOLS["whisper-cli"], "-m", str(model_path), "-f", str(wav), "-l", lang, "-t", str(threads),
         "-oj", "-of", str(prefix), "-np", "-pp",
     ]
     if vad_path is not None:
@@ -397,6 +448,20 @@ def process(video: Path, args: argparse.Namespace, model_path: Path, vad_path: P
     return True
 
 
+def expand_files(files: list[Path]) -> list[Path]:
+    """Expand ~ and wildcards ourselves: cmd.exe and PowerShell pass "*.mp4" through as is."""
+    out: list[Path] = []
+    for f in files:
+        f = f.expanduser()
+        if not f.exists() and glob.has_magic(str(f)):
+            matches = sorted(glob.glob(str(f)))
+            if matches:
+                out.extend(Path(m) for m in matches)
+                continue
+        out.append(f)
+    return out
+
+
 def default_threads() -> int:
     return max(1, min(8, (os.cpu_count() or 4) // 2))
 
@@ -405,9 +470,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="transcribe",
         description="Transcribe videos locally (OBS mkv/mp4, or any file ffmpeg can read) "
-                    "into Markdown ready to hand to Claude. Engine: whisper.cpp (Vulkan GPU or CPU).",
+                    "into Markdown ready to hand to Claude. Engine: whisper.cpp (GPU or CPU).",
         epilog="Environment variables: VIT_MODEL, VIT_LANG, VIT_MODELS_DIR, VIT_OUT_DIR, "
                "VIT_DEVICE, VIT_PROMPT (they override the defaults of the options above).\n"
+               "VIT_FFMPEG, VIT_FFPROBE, VIT_WHISPER_CLI: paths of the tools [found on the PATH].\n"
                "Examples:\n"
                "  transcribe ~/Videos/2026-09-24_14-05-02.mp4\n"
                "  transcribe -l fr --srt ~/Videos/*.mp4\n"
@@ -431,7 +497,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--cpu", action="store_true", help="force the CPU (no GPU)")
     p.add_argument("--device", type=int, metavar="N",
                    default=int(os.environ["VIT_DEVICE"]) if os.environ.get("VIT_DEVICE") else None,
-                   help="Vulkan GPU index [auto: dedicated GPU if present]")
+                   help="GPU index (Vulkan or CUDA) [auto: dedicated GPU if present]")
     p.add_argument("-t", "--threads", type=int, default=default_threads(), help="CPU threads [%(default)s]")
     p.add_argument("-f", "--force", action="store_true", help="transcribe again even if the .md already exists")
     p.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS_DIR, help="model directory [%(default)s]")
@@ -440,7 +506,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    setup_console()
     args = parse_args(argv)
+    args.files = expand_files(args.files)
     try:
         check_dependencies()
         model_path = ensure_model(args.models_dir, args.model)
@@ -451,14 +519,17 @@ def main(argv: list[str] | None = None) -> int:
             info("Compute: CPU")
         elif args.device is not None:
             device = args.device
-            info(f"Compute: Vulkan GPU #{device}")
+            info(f"Compute: GPU #{device}")
         else:
             picked = pick_gpu_device()
             if picked is None:
-                info("Compute: no Vulkan GPU found, using the CPU")
+                info("Compute: no GPU found, using the CPU")
+            elif picked is False:
+                args.cpu = True  # only a software Vulkan renderer: slower than the CPU backend
+                info("Compute: no hardware GPU found (only a software Vulkan renderer), using the CPU")
             else:
                 device = picked[0]
-                info(f"Compute: {picked[1]} (Vulkan #{device})")
+                info(f"Compute: {picked[1]} ({picked[2]} #{device})")
 
         failures = 0
         for video in args.files:

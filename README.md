@@ -4,8 +4,54 @@ Turns OBS recordings (`.mkv`, `.mp4`, or any file ffmpeg can read) into a Markdo
 hand to Claude, **100% locally**. Nothing leaves the machine, and there is no quota or length limit.
 
 Engine: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (a C/C++ port of OpenAI's Whisper
-model, MIT license) running the `large-v3-turbo` model on the GPU through Vulkan, packaged with Nix.
+model, MIT license) running the `large-v3-turbo` model on the GPU (Vulkan or CUDA) or the CPU.
 The `transcribe.py` script (plain Python, no dependencies) chains ffmpeg → whisper.cpp → formatting.
+
+## Launchers
+
+`transcribe.py` is the same everywhere; one launcher per system provides ffmpeg, whisper.cpp and
+Python, then runs it with your arguments:
+
+| System | Command | First run |
+|---|---|---|
+| NixOS, or any Linux with Nix | `./transcribe` | Nix fetches whisper.cpp (Vulkan) and ffmpeg from the binary cache |
+| Debian, Ubuntu | `./transcribe-debian` | Installs `python3`, `ffmpeg` and the build tools with apt (sudo), then builds whisper.cpp (a few minutes; Vulkan on Ubuntu 24.04+ / Debian 13, CPU on older releases) |
+| Windows 10/11 | `transcribe-windows` (cmd or PowerShell, from the repository) | Downloads a portable Python, ffmpeg and the prebuilt whisper.cpp (CUDA build if there is an NVIDIA GPU, CPU build otherwise) |
+
+All three take the same options; the examples below use `./transcribe`.
+
+### Debian / Ubuntu
+
+```sh
+git clone https://github.com/typovrak/obs-transcribe && cd obs-transcribe
+./transcribe-debian ~/Videos/2026-09-24_14-05-02.mp4
+```
+
+whisper.cpp is built once into `~/.local/share/obs-transcribe/whisper.cpp-<version>-<backend>/`.
+Vulkan uses the GPU with the NVIDIA driver as well as with Mesa (AMD, Intel), and needs Ubuntu
+24.04 or newer (or Debian 13). Ubuntu 22.04 has no `glslc` package and Debian 12's Vulkan headers
+are too old, so there the build is CPU-only; `TRANSCRIBE_GPU=cuda ./transcribe-debian …` builds for
+CUDA instead if the CUDA toolkit is installed. If the Vulkan build fails anyway, the launcher falls
+back to a CPU build. Tested in Debian 12, Ubuntu 22.04 and Ubuntu 24.04 containers (without a GPU). To rebuild, delete that directory (or set `TRANSCRIBE_GPU=vulkan|cuda|cpu` to build
+another backend next to it).
+
+### Windows
+
+Download the repository (`git clone`, or *Code → Download ZIP* on GitHub), open a terminal in it:
+
+```powershell
+.\transcribe-windows "C:\Users\me\Videos\2026-09-24 14-05-02.mkv"
+.\transcribe-windows -l fr C:\Users\me\Videos\*.mkv
+```
+
+Everything goes into `%LOCALAPPDATA%\obs-transcribe\` (Python, ffmpeg, whisper.cpp, models): no
+administrator rights, nothing installed system-wide, delete that directory to uninstall. If
+`ffmpeg` and `ffprobe` are already on the PATH (e.g. `winget install Gyan.FFmpeg`), they are used.
+whisper.cpp publishes no Vulkan build for Windows, so AMD and Intel GPUs run on the CPU there;
+`$env:TRANSCRIBE_GPU = "cpu"` (PowerShell) or `set TRANSCRIBE_GPU=cpu` (cmd) forces the CPU build on
+an NVIDIA machine. `transcribe-windows.cmd` only starts
+`windows\launcher.ps1` with `-ExecutionPolicy Bypass`, because PowerShell refuses to run `.ps1`
+scripts by default.
 
 ## Usage
 
@@ -18,9 +64,9 @@ The `transcribe.py` script (plain Python, no dependencies) chains ffmpeg → whi
 ./transcribe --stdout meeting.mkv | claude -p "Summarize this meeting in 10 points"
 ```
 
-On the first run, Nix fetches whisper.cpp and ffmpeg from the binary cache (nothing to compile). The
-script then downloads the Whisper model (1.6 GB) and the Silero voice activity detection model into
-`~/.local/share/obs-transcribe/models/`.
+On the first run, the script downloads the Whisper model (1.6 GB) and the Silero voice activity
+detection model into `~/.local/share/obs-transcribe/models/` (`%LOCALAPPDATA%\obs-transcribe\models\`
+on Windows).
 
 ### Output
 
@@ -58,11 +104,12 @@ lets you ask Claude "when do we talk about X?" or find the passage in the video.
 | `--prompt PROMPT` | Initial prompt for Whisper: proper nouns, technical vocabulary, punctuation style |
 | `--track N` | Use only audio track N (multi-track OBS recordings) instead of mixing all tracks |
 | `--no-vad` | Disable voice activity detection (VAD), which skips silences |
-| `--cpu` / `--device N` | Force the CPU, or pick Vulkan GPU N (default: the dedicated GPU) |
+| `--cpu` / `--device N` | Force the CPU, or pick GPU N, Vulkan or CUDA (default: the dedicated GPU) |
 | `-f, --force` | Transcribe again even if the `.md` already exists |
 
 Environment variables override the same defaults: `VIT_MODEL`, `VIT_LANG`, `VIT_OUT_DIR`,
-`VIT_MODELS_DIR`, `VIT_DEVICE`, `VIT_PROMPT`.
+`VIT_MODELS_DIR`, `VIT_DEVICE`, `VIT_PROMPT`. `VIT_FFMPEG`, `VIT_FFPROBE` and `VIT_WHISPER_CLI`
+point to the tools if they are not on the PATH.
 
 ## Measured performance
 
@@ -89,7 +136,7 @@ at about 3× real time. Keep the GPU.
 `./transcribe -m large-v3 video.mp4` or `VIT_MODEL=large-v3`. The models come from
 [huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main).
 
-## Installing the `transcribe` command
+## Installing the `transcribe` command (Nix)
 
 The `./transcribe` wrapper runs `nix run path:<this directory>`. To get `transcribe` on your PATH:
 
@@ -128,7 +175,9 @@ To update whisper.cpp, run `nix flake update` (`flake.lock` pins the nixpkgs rev
   la communauté d'Amara.org", "Thanks for watching"…) and repetition loops are filtered in
   `transcribe.py` (`HALLUCINATION_PATTERNS`).
 - **GPU:** on this laptop, Vulkan device 0 is the Intel iGPU and the 1660 Ti is device 1; the script
-  picks the dedicated GPU automatically. CUDA is not needed. To try it anyway, pass
+  picks the dedicated GPU automatically. If Vulkan only exposes a software renderer (llvmpipe, e.g.
+  in a VM or a container), it uses the CPU backend, which is faster. With Nix, CUDA is not needed. To
+  try it anyway, pass
   `whisperPackage = pkgs.whisper-cpp.override { cudaSupport = true; }` to the package through
   `.override` (long build).
 - **Speakers:** Whisper does not know who is speaking. If you need that one day, look at
