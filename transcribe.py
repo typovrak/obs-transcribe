@@ -435,7 +435,9 @@ def process(video: Path, args: argparse.Namespace, model_path: Path, vad_path: P
 
     lang_label = language if paragraphs else "no speech"
     elapsed = time.monotonic() - t0
-    speed = f", {duration / elapsed:.0f}x real time" if elapsed > 0 and duration else ""
+    ratio = duration / elapsed if elapsed > 0 and duration else 0
+    # One decimal below 10x: on a CPU the ratio is often under 1 and ".0f" printed "0x"
+    speed = f", {ratio:.{0 if ratio >= 10 else 1}f}x real time" if ratio else ""
     if args.stdout:
         sys.stdout.write(md)
         sys.stdout.flush()
